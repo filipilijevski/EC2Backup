@@ -1,0 +1,95 @@
+#!/bin/bash
+
+set -euo pipefail
+IFS=$'\n\t'
+
+# Verify commands required
+for cmd in rsync sendmail mkdir chmod tee date echo; do
+    command -v "$cmd" > /dev/null || { echo "ERROR: '$cmd' is not installed"; exit 1;}
+done
+
+# Function for logging messages during backup
+log_message() {
+    local message="$1"
+    echo "$(date +"%Y-%m-%d %H:%M:%S") - $message" | tee -a "$log_dir/$log_file"
+}
+
+# Function to send emails using sendmail and postfix
+send_email() {
+    local subject="$1"
+    local body="$2"
+    local recipient="${EMAIL_RECIPIENT:-$USER@localhost}"
+
+    # Make email headers, body and pipe to sendmail
+    {
+        echo "Subject: $subject"
+        echo "To: $recipient"
+        echo "Content-Type: text/plain; charset=UTF-8"
+        echo
+        echo "$body"
+    } | sendmail -t || log_message "WARNING: Failed to send email via sendmail."
+}
+
+# Make sure source directory exists, is readable and writable 
+validate_directories() {
+    if [[ -z "$source_dir" || ! -d "$source_dir" || ! -r "$source_dir" ]]; then
+        log_message "ERROR: Invalid or unreadable source directory: '$source_dir'"
+        send_email "Backup Script Error" "Source directory '$source_dir' is invalid or not readable."
+        exit 1
+    fi
+}
+
+# Set up date, logging and environment
+current_date=$(date +%Y-%m-%d)
+log_dir="${LOG_DIR:-logs}"
+log_file="backup_${current_date}.log"
+dry_run="${DRY_RUN:-false}"
+
+# Make sure that all required environment variables are set
+: "${REMOTE_USER:?Environment variable REMOTE_USER is required}"
+: "${REMOTE_HOST:?Environment variable REMOTE_HOST is required}"
+: "${KEY_FILE:?Environment variable KEY_FILE is required}"
+: "${REMOTE_BASE_DIR:?Environment variable REMOTE_BASE_DIR is required}"
+
+if [ $# -ne 1 ]; then
+    echo "Usage: $0 <source_directory>"
+    exit 1
+fi
+
+source_dir="$1"
+validate_directories
+
+# Create local log directory with secure permissions
+mkdir -p "$log_dir"
+chmod 700 "$log_dir"
+
+remote_path="$REMOTE_BASE_DIR/$current_date"
+
+# Configure rsync options
+
+rsync_options=(-a -v -b "--backup-dir=$remote_path" --delete)
+if [ "$dry_run" = true ]; then
+    rsync_options+=("--dry-run")
+    dry_run_status="ENABLED"
+else
+    dry_run_status="DISABLED"
+fi
+
+log_message "----------------------------------------"
+log_message "Backup Started"
+log_message "Source: $source_dir"
+log_message "Target: $REMOTE_USER@$REMOTE_HOST:$remote_path"
+log_message "Dry Run Mode: $dry_run_status"
+log_message "----------------------------------------"
+
+# Perform rsync over SSH
+if rsync "${rsync_options[@]}" -e "ssh -i $KEY_FILE" "$source_dir" "$REMOTE_USER@$REMOTE_HOST:$remote_path"; then
+    log_message "Backup completed successfully."
+    send_email "EC2 Backup succeeded" "Backup of '$source_dir' to EC2 completed successfully. Log: $log_dir/$log_file"
+else
+    log_message "ERROR: Backup failed."
+    send_email "EC2 Backup Failed" "Backup of '$source_dir' failed. Please check the log at $log_dir/$log_file"
+    exit 1
+fi
+
+log_message "----------------------------------------"
